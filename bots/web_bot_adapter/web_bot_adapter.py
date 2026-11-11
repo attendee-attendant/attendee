@@ -833,12 +833,15 @@ class WebBotAdapter(BotAdapter):
             "--disable-blink-features=AutomationControlled",
             "--disable-features=LocalNetworkAccessChecks",
             "--password-store=basic",
+            # Suppresses the "unsupported command-line flag" infobar (e.g. for --no-sandbox or
+            # --disable-blink-features=AutomationControlled), which shifts the page down and breaks
+            # humanized clicks. chromedriver always passes it too.
+            "--test-type",
         ]
         if self.subclass_specific_use_disable_gpu_chrome_option():
             chrome_args.append("--disable-gpu")
         if os.getenv("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
-            # --test-type suppresses the "unsupported command-line flag" infobar, which shifts the page down (chromedriver passes it too)
-            chrome_args += ["--no-sandbox", "--disable-setuid-sandbox", "--test-type"]
+            chrome_args += ["--no-sandbox", "--disable-setuid-sandbox"]
         if self.websocket_host:
             chrome_args.append(f"--host-resolver-rules=MAP localhost {self.websocket_host}")
 
