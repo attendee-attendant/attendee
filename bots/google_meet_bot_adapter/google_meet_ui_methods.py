@@ -11,7 +11,6 @@ import redis
 import requests
 from django.conf import settings
 from selenium.common.exceptions import ElementNotInteractableException, NoSuchElementException, StaleElementReferenceException, TimeoutException
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -538,7 +537,7 @@ class GoogleMeetUIMethods:
             logger.info("Captions and translation button is already pressed, captions are already enabled")
             return
         logger.info("Found 'Captions and translation' variant of captions button. Pressing 'c' to enable captions...")
-        ActionChains(self.driver).send_keys("c").perform()
+        self.driver.send_key("c")
         logger.info("Waiting for captions to be enabled...")
         WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Captions and translation"][aria-pressed="true"]')))
         logger.info("Confirmed captions were enabled")
@@ -1195,19 +1194,6 @@ class GoogleMeetUIMethods:
 
         self.driver.get(self.meeting_url)
 
-        self.driver.execute_cdp_cmd(
-            "Browser.grantPermissions",
-            {
-                "origin": self.meeting_url,
-                "permissions": [
-                    "geolocation",
-                    "audioCapture",
-                    "displayCapture",
-                    "videoCapture",
-                ],
-            },
-        )
-
         self.check_if_meeting_is_found()
 
         self.fill_out_name_input()
@@ -1263,8 +1249,7 @@ class GoogleMeetUIMethods:
 
     def scroll_element_into_view(self, element, step):
         try:
-            actions = ActionChains(self.driver)
-            actions.move_to_element(element).perform()
+            element.scroll_into_view()
             logger.info(f"Scrolled element into view for {step}")
         except Exception as e:
             logger.warning(f"Error scrolling element into view for {step}")

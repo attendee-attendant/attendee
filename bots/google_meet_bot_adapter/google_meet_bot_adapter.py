@@ -51,6 +51,9 @@ class GoogleMeetBotAdapter(WebBotAdapter, GoogleMeetUIMethods):
         logger.info("Meeting requires login and Google meet bot login is available, so we will retry by logging in")
         return True
 
+    def use_extension_driver(self):
+        return True
+
     def get_chromedriver_payload_file_names(self):
         return ["google_meet_bot_adapter/google_meet_chromedriver_payload.js"]
 

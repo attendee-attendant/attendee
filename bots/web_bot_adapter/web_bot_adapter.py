@@ -707,12 +707,12 @@ class WebBotAdapter(BotAdapter):
     def subclass_specific_chrome_policies(self):
         return {}
 
-    def write_chrome_policies_file(self):
+    def write_chrome_policies_file(self, extra_policies=None):
         # Check if the /etc/.../attendee-chrome-policies.json symlink exists. If not, skip this, we are not running in the docker container.
         if not os.path.islink("/etc/opt/chrome/policies/managed/attendee-chrome-policies.json"):
             logger.warning("Attendee chrome policy file symlink does not exist, skipping writing chrome policies.")
             return
-        policy = self.subclass_specific_chrome_policies()
+        policy = {**self.subclass_specific_chrome_policies(), **(extra_policies or {})}
         with open("/tmp/attendee-chrome-policies.json", "w") as f:
             json.dump(policy, f, indent=2)
         logger.info("Chrome policy file written to /tmp/attendee-chrome-policies.json: %s", policy)
@@ -814,7 +814,55 @@ class WebBotAdapter(BotAdapter):
                 logger.warning(f"Error running pkill for {user_data_dir}: {e}")
             logger.info(f"Killed processes with user_data_dir {user_data_dir}")
 
+    # POC: when True, chrome is driven by a force-installed extension instead of chromedriver / CDP
+    def use_extension_driver(self):
+        return False
+
+    def init_extension_driver(self):
+        from .extension_driver import ExtensionDriver
+
+        chrome_args = [
+            "--autoplay-policy=no-user-gesture-required",
+            "--use-fake-device-for-media-stream",
+            "--use-fake-ui-for-media-stream",
+            f"--window-size={self.video_frame_size[0]},{self.video_frame_size[1]}",
+            "--start-fullscreen",
+            "--window-position=0,0",
+            "--disable-application-cache",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=LocalNetworkAccessChecks",
+            "--password-store=basic",
+        ]
+        if self.subclass_specific_use_disable_gpu_chrome_option():
+            chrome_args.append("--disable-gpu")
+        if os.getenv("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
+            # --test-type suppresses the "unsupported command-line flag" infobar, which shifts the page down (chromedriver passes it too)
+            chrome_args += ["--no-sandbox", "--disable-setuid-sandbox", "--test-type"]
+        if self.websocket_host:
+            chrome_args.append(f"--host-resolver-rules=MAP localhost {self.websocket_host}")
+
+        class ArgCollector:
+            def add_argument(self, arg):
+                chrome_args.append(arg)
+
+        self.add_subclass_specific_chrome_options(ArgCollector())
+
+        if self.driver:
+            self.teardown_driver(graceful_shutdown_fn=self.default_graceful_driver_shutdown)
+            self.driver = None
+
+        self.driver = ExtensionDriver(
+            chrome_args=chrome_args,
+            payload_code=self.build_payload_code(),
+            host=self.websocket_host,
+            write_policies_fn=self.write_chrome_policies_file,
+        )
+
     def init_driver(self):
+        if self.use_extension_driver():
+            return self.init_extension_driver()
+
         self.write_chrome_policies_file()
 
         options = webdriver.ChromeOptions()
@@ -863,6 +911,10 @@ class WebBotAdapter(BotAdapter):
         self.start_domain_allow_list_listener()
         logger.info(f"web driver server initialized at port {self.driver.service.port}")
 
+        # Add the combined script to execute on new document
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": self.build_payload_code()})
+
+    def build_payload_code(self):
         initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, perParticipantRealtimeVideoConfiguration: {json.dumps(self.per_participant_realtime_video_configuration.to_dict())}, roomSyncSourceParticipantConfiguration: {json.dumps(self.room_sync_source_participant_configuration.to_dict()) if self.room_sync_source_participant_configuration else 'null'}, sendPerParticipantVideo: {'true' if self.add_per_participant_video_frame_callback else 'false'}, collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}}}"
 
         # Get directory of current file
@@ -901,9 +953,7 @@ class WebBotAdapter(BotAdapter):
             {shared_chromedriver_payload_code}
             {payload_code}
         """
-
-        # Add the combined script to execute on new document
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": combined_code})
+        return combined_code
 
     def start_domain_allow_list_listener(self):
         try:
