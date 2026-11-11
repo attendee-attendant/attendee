@@ -838,6 +838,7 @@ class WebBotAdapter(BotAdapter):
 
         self.driver = ExtensionDriver(
             browser_args=browser_args,
+            window_size=tuple(self.video_frame_size),
             payload_code=self.build_payload_code(),
             host=self.websocket_host,
         )

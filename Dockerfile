@@ -110,14 +110,15 @@ ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
 RUN echo "93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c  /tini" | sha256sum -c -
 RUN chmod +x /tini
 
-# Install Firefox ESR from Mozilla's APT repo. ESR (unlike release Firefox) honors
-# xpinstall.signatures.required=false, which lets us load our unsigned bot extension.
-RUN install -d -m 0755 /etc/apt/keyrings \
-    && wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /etc/apt/keyrings/packages.mozilla.org.asc \
-    && echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" > /etc/apt/sources.list.d/mozilla.list \
-    && printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' > /etc/apt/preferences.d/mozilla \
-    && apt-get update && apt-get install -y firefox-esr \
-    && rm -rf /var/lib/apt/lists/*
+# Install Camoufox (anti-fingerprinting Firefox fork). We launch the binary ourselves and only use the
+# python package to generate fingerprints. The package pins this exact browser release (browser-pin.json).
+ENV CAMOUFOX_EXECUTABLE_PATH=/opt/camoufox/camoufox-bin
+RUN apt-get update && apt-get install -y libgtk-3-0 libasound2 libx11-xcb1 libdbus-glib-1-2 && rm -rf /var/lib/apt/lists/* \
+    && wget -q https://github.com/daijro/camoufox/releases/download/v158.0.1-beta.41/camoufox-158.0.1-beta.41-lin.x86_64.zip -O /tmp/camoufox.zip \
+    && echo "3f2eb1d0451fa58e45e43e55f5e6181565069791ae60c0574f0ceb1f01341c33  /tmp/camoufox.zip" | sha256sum -c - \
+    && mkdir -p /opt/camoufox && unzip -q /tmp/camoufox.zip -d /opt/camoufox && rm /tmp/camoufox.zip \
+    && pip install --timeout 120 --retries 5 camoufox==0.5.9 \
+    && python3 -c "from camoufox.fpgen_model import load_fpgen; load_fpgen()"
 
 WORKDIR /opt
 

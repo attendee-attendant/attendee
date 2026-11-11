@@ -1,7 +1,8 @@
-"""A webdriver-free stand-in for selenium's webdriver, backed by Firefox and a WebExtension.
+"""A webdriver-free stand-in for selenium's webdriver, backed by Camoufox and a WebExtension.
 
-Firefox ESR is launched as a plain subprocess with a fresh profile that has our (unsigned) extension
-sideloaded into it. The extension does the work that chromedriver / CDP used to do:
+Camoufox (an anti-fingerprinting Firefox fork) is launched as a plain subprocess, not through Playwright / juggler.
+We only use the camoufox python package to generate a fingerprint (passed to the browser as CAMOU_CONFIG_* env vars)
+and to have Camoufox install our unpacked extension as a temporary addon at startup. The extension does the work that chromedriver / CDP used to do:
   - a MAIN world content script injected at document_start replaces Page.addScriptToEvaluateOnNewDocument
   - the extension's background page connects back to us over a websocket and executes commands
     (execute_script, find_element, navigation, cookies, screenshots) using extension APIs.
@@ -20,7 +21,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import zipfile
 
 from selenium.common.exceptions import (
     ElementNotInteractableException,
@@ -33,7 +33,7 @@ from websockets.sync.server import serve
 
 logger = logging.getLogger(__name__)
 
-FIREFOX_BINARY = "firefox-esr"
+CAMOUFOX_BINARY = os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "/opt/camoufox/camoufox-bin")
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXTENSION_TEMPLATE_DIR = os.path.join(CURRENT_DIR, "chrome_extension")
 FIREFOX_POLYFILLS_PATH = os.path.join(CURRENT_DIR, "firefox_polyfills.js")
@@ -49,11 +49,6 @@ SPECIAL_KEYS = {
 }
 
 FIREFOX_PREFS = {
-    # Release Firefox ignores this; ESR honors it, so our unsigned extension can load
-    "xpinstall.signatures.required": False,
-    # Enable extensions sideloaded into the profile without a prompt
-    "extensions.autoDisableScopes": 0,
-    "extensions.enabledScopes": 15,
     # Never suspend the extension's background page (it holds the control websocket)
     "extensions.background.idle.enabled": False,
     # Equivalents of --use-fake-device-for-media-stream / --use-fake-ui-for-media-stream / --autoplay-policy
@@ -181,7 +176,7 @@ class ExtensionElement:
 
 
 class ExtensionDriver:
-    def __init__(self, *, browser_args, payload_code, host, connect_timeout_seconds=60):
+    def __init__(self, *, browser_args, window_size, payload_code, host, connect_timeout_seconds=60):
         self._host = host or "127.0.0.1"
         self._ids = itertools.count(1)
         self._pending = {}
@@ -192,23 +187,37 @@ class ExtensionDriver:
 
         self._work_dir = tempfile.mkdtemp(prefix="attendee-ext-")
         self._profile_dir = os.path.join(self._work_dir, "profile")
+        self._extension_dir = os.path.join(self._work_dir, "extension")
         # teardown_driver pkills by this path
         self.capabilities = {"chrome": {"userDataDir": self._profile_dir}}
 
         self._start_control_server()
         self._build_profile(payload_code)
 
+        # Generates a fingerprint (CAMOU_CONFIG_*), per identity prefs (CAMOU_PREFS_*) and the addon list.
+        # It briefly launches the browser to probe the host GPU, so it needs DISPLAY to be set.
+        from camoufox.addons import DefaultAddons
+        from camoufox.utils import launch_options
+
+        options = launch_options(
+            executable_path=CAMOUFOX_BINARY,
+            os="linux",
+            window=window_size,
+            headless=False,
+            addons=[self._extension_dir],
+            exclude_addons=[DefaultAddons.UBO],
+            i_know_what_im_doing=True,
+        )
+
         # Firefox's sandbox falls back to seccomp-only when it can't create user namespaces (e.g. in docker),
         # so we leave it on. Disabling it shows a "security sandbox is disabled" infobar that shifts the page.
-        env = dict(os.environ)
-
-        cmd = [FIREFOX_BINARY, *browser_args, "--profile", self._profile_dir, "--no-remote", "about:blank"]
-        logger.info(f"Launching firefox: {cmd}")
-        self.service = _ProcessHolder(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=env))
+        cmd = [options["executable_path"], *options["args"], *browser_args, "--profile", self._profile_dir, "--no-remote", "about:blank"]
+        logger.info(f"Launching camoufox: {cmd}")
+        self.service = _ProcessHolder(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=options["env"]))
 
         if not self._connected.wait(connect_timeout_seconds):
-            raise TimeoutException(f"Firefox extension did not connect within {connect_timeout_seconds}s")
-        logger.info("Firefox extension connected")
+            raise TimeoutException(f"Camoufox extension did not connect within {connect_timeout_seconds}s")
+        logger.info("Camoufox extension connected")
 
     # ---- setup ----
 
@@ -246,18 +255,19 @@ class ExtensionDriver:
             with open(os.path.join(EXTENSION_TEMPLATE_DIR, name), "r") as f:
                 files[name] = f.read()
 
-        # Sideload the extension: <profile>/extensions/<id>.xpi
-        extensions_dir = os.path.join(self._profile_dir, "extensions")
-        os.makedirs(extensions_dir)
-        with zipfile.ZipFile(os.path.join(extensions_dir, f"{EXTENSION_ID}.xpi"), "w") as xpi:
-            for name, content in files.items():
-                xpi.writestr(name, content)
+        # Unpacked extension, which Camoufox installs as a temporary addon (no signing needed)
+        os.makedirs(self._extension_dir)
+        for name, content in files.items():
+            with open(os.path.join(self._extension_dir, name), "w") as f:
+                f.write(content)
+
+        os.makedirs(self._profile_dir)
 
         with open(os.path.join(self._profile_dir, "user.js"), "w") as f:
             for key, value in FIREFOX_PREFS.items():
                 f.write(f"user_pref({json.dumps(key)}, {json.dumps(value)});\n")
 
-        logger.info(f"Built firefox profile with extension at {self._profile_dir}")
+        logger.info(f"Built camoufox profile with extension at {self._profile_dir}")
 
     # ---- command channel ----
 
