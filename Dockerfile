@@ -110,6 +110,15 @@ ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
 RUN echo "93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c  /tini" | sha256sum -c -
 RUN chmod +x /tini
 
+# Install Firefox ESR from Mozilla's APT repo. ESR (unlike release Firefox) honors
+# xpinstall.signatures.required=false, which lets us load our unsigned bot extension.
+RUN install -d -m 0755 /etc/apt/keyrings \
+    && wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /etc/apt/keyrings/packages.mozilla.org.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" > /etc/apt/sources.list.d/mozilla.list \
+    && printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' > /etc/apt/preferences.d/mozilla \
+    && apt-get update && apt-get install -y firefox-esr \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /opt
 
 FROM deps AS build

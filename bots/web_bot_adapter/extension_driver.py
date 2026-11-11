@@ -1,9 +1,9 @@
-"""A chromedriver-free stand-in for selenium's webdriver.Chrome.
+"""A webdriver-free stand-in for selenium's webdriver, backed by Firefox and a WebExtension.
 
-Chrome is launched as a plain subprocess and a force-installed extension does the work that
-chromedriver / CDP used to do:
+Firefox ESR is launched as a plain subprocess with a fresh profile that has our (unsigned) extension
+sideloaded into it. The extension does the work that chromedriver / CDP used to do:
   - a MAIN world content script injected at document_start replaces Page.addScriptToEvaluateOnNewDocument
-  - the extension's service worker connects back to us over a websocket and executes commands
+  - the extension's background page connects back to us over a websocket and executes commands
     (execute_script, find_element, navigation, cookies, screenshots) using extension APIs.
 
 Only the subset of the selenium API that the Google Meet adapter uses is implemented. Selenium's
@@ -11,8 +11,6 @@ pure python helpers (By, WebDriverWait, expected_conditions, exceptions) still w
 """
 
 import base64
-import hashlib
-import http.server
 import itertools
 import json
 import logging
@@ -22,6 +20,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 
 from selenium.common.exceptions import (
     ElementNotInteractableException,
@@ -34,23 +33,61 @@ from websockets.sync.server import serve
 
 logger = logging.getLogger(__name__)
 
-CHROME_BINARY = "google-chrome"
-EXTENSION_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_extension")
+FIREFOX_BINARY = "firefox-esr"
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+EXTENSION_TEMPLATE_DIR = os.path.join(CURRENT_DIR, "chrome_extension")
+FIREFOX_POLYFILLS_PATH = os.path.join(CURRENT_DIR, "firefox_polyfills.js")
+EXTENSION_ID = "attendee-bot@attendee.dev"
 
 # Selenium Keys that we translate to real X11 key presses
 SPECIAL_KEYS = {
-    "": "Return",
-    "": "Return",
-    "": "Tab",
-    "": "Escape",
-    "": "BackSpace",
+    "\ue006": "Return",
+    "\ue007": "Return",
+    "\ue004": "Tab",
+    "\ue00c": "Escape",
+    "\ue003": "BackSpace",
 }
 
-
-def extension_id_from_pem(pem_path):
-    der = subprocess.run(["openssl", "rsa", "-in", pem_path, "-pubout", "-outform", "DER"], capture_output=True, check=True).stdout
-    digest = hashlib.sha256(der).hexdigest()[:32]
-    return "".join(chr(ord("a") + int(c, 16)) for c in digest)
+FIREFOX_PREFS = {
+    # Release Firefox ignores this; ESR honors it, so our unsigned extension can load
+    "xpinstall.signatures.required": False,
+    # Enable extensions sideloaded into the profile without a prompt
+    "extensions.autoDisableScopes": 0,
+    "extensions.enabledScopes": 15,
+    # Never suspend the extension's background page (it holds the control websocket)
+    "extensions.background.idle.enabled": False,
+    # Equivalents of --use-fake-device-for-media-stream / --use-fake-ui-for-media-stream / --autoplay-policy
+    "media.navigator.streams.fake": True,
+    "media.navigator.permission.disabled": True,
+    "media.autoplay.default": 0,
+    "media.autoplay.blocking_policy": 0,
+    # No first-run / UI noise that could overlay the page
+    "browser.shell.checkDefaultBrowser": False,
+    "browser.startup.homepage_override.mstone": "ignore",
+    "browser.aboutwelcome.enabled": False,
+    # Skip the "Welcome to Firefox" terms of use modal, which covers the page
+    "termsofuse.bypassNotification": True,
+    "termsofuse.acceptedVersion": 999,
+    "termsofuse.acceptedDate": "1700000000000",
+    "datareporting.policy.dataSubmissionPolicyBypassNotification": True,
+    "browser.preonboarding.enabled": False,
+    # Disable onboarding messages, e.g. the "We've updated our Privacy Notice" infobar that shifts the page down
+    "browser.newtabpage.activity-stream.asrouter.providers.onboarding": json.dumps({"id": "onboarding", "type": "local", "localProvider": "OnboardingMessageProvider", "enabled": False, "exclude": []}),
+    "datareporting.policy.dataSubmissionEnabled": False,
+    "toolkit.telemetry.reportingpolicy.firstRun": False,
+    "browser.translations.automaticallyPopup": False,
+    "signon.rememberSignons": False,
+    "full-screen-api.warning.timeout": 0,
+    "privacy.webrtc.hideGlobalIndicator": True,
+    "app.update.enabled": False,
+    # Grant MV3 host permissions (<all_urls>) at install, instead of leaving them optional
+    "extensions.originControls.grantByDefault": True,
+    # Local network access checks would block the extension / page websockets to our 127.x.x.x servers
+    "network.lna.enabled": False,
+    "network.lna.blocking": False,
+    # The Meet page (https) talks to our ws://127.x.x.x server
+    "network.websocket.allowInsecureFromHTTPS": True,
+}
 
 
 class _ProcessHolder:
@@ -144,7 +181,7 @@ class ExtensionElement:
 
 
 class ExtensionDriver:
-    def __init__(self, *, chrome_args, payload_code, host, write_policies_fn, connect_timeout_seconds=60):
+    def __init__(self, *, browser_args, payload_code, host, connect_timeout_seconds=60):
         self._host = host or "127.0.0.1"
         self._ids = itertools.count(1)
         self._pending = {}
@@ -154,33 +191,24 @@ class ExtensionDriver:
         self._x11_input = None
 
         self._work_dir = tempfile.mkdtemp(prefix="attendee-ext-")
-        self._user_data_dir = os.path.join(self._work_dir, "profile")
-        self.capabilities = {"chrome": {"userDataDir": self._user_data_dir}}
+        self._profile_dir = os.path.join(self._work_dir, "profile")
+        # teardown_driver pkills by this path
+        self.capabilities = {"chrome": {"userDataDir": self._profile_dir}}
 
         self._start_control_server()
-        self._build_extension(payload_code)
-        self._start_http_server()
+        self._build_profile(payload_code)
 
-        write_policies_fn(
-            {
-                "ExtensionSettings": {
-                    self.extension_id: {
-                        "installation_mode": "force_installed",
-                        "update_url": f"http://{self._host}:{self._http_port}/updates.xml",
-                    }
-                }
-            }
-        )
+        # Firefox's sandbox falls back to seccomp-only when it can't create user namespaces (e.g. in docker),
+        # so we leave it on. Disabling it shows a "security sandbox is disabled" infobar that shifts the page.
+        env = dict(os.environ)
 
-        cmd = [CHROME_BINARY, *chrome_args, f"--user-data-dir={self._user_data_dir}", "--no-first-run", "--no-default-browser-check", "about:blank"]
-        logger.info(f"Launching chrome: {cmd}")
-        self.service = _ProcessHolder(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
+        cmd = [FIREFOX_BINARY, *browser_args, "--profile", self._profile_dir, "--no-remote", "about:blank"]
+        logger.info(f"Launching firefox: {cmd}")
+        self.service = _ProcessHolder(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=env))
 
         if not self._connected.wait(connect_timeout_seconds):
-            raise TimeoutException(f"Chrome extension did not connect within {connect_timeout_seconds}s")
-        logger.info(f"Chrome extension {self.extension_id} connected")
-        # --start-fullscreen is not reliable without chromedriver. The humanized mouse code needs page coordinates == screen coordinates.
-        self._command("fullscreen")
+            raise TimeoutException(f"Firefox extension did not connect within {connect_timeout_seconds}s")
+        logger.info("Firefox extension connected")
 
     # ---- setup ----
 
@@ -206,54 +234,30 @@ class ExtensionDriver:
         threading.Thread(target=self._control_server.serve_forever, daemon=True, name="extension-control-server").start()
         logger.info(f"Extension control server listening on ws://{self._host}:{self._control_port}")
 
-    def _build_extension(self, payload_code):
-        ext_dir = os.path.join(self._work_dir, "ext")
-        shutil.copytree(EXTENSION_TEMPLATE_DIR, ext_dir)
-        with open(os.path.join(ext_dir, "payload.js"), "w") as f:
-            f.write(payload_code)
-        with open(os.path.join(ext_dir, "config.js"), "w") as f:
-            f.write(f"self.ATTENDEE_CONTROL_URL = {json.dumps(f'ws://{self._host}:{self._control_port}')};\n")
+    def _build_profile(self, payload_code):
+        with open(FIREFOX_POLYFILLS_PATH, "r") as f:
+            polyfills = f.read()
 
-        pack_profile = os.path.join(self._work_dir, "pack-profile")
-        subprocess.run(
-            [CHROME_BINARY, "--no-sandbox", f"--user-data-dir={pack_profile}", f"--pack-extension={ext_dir}"],
-            capture_output=True,
-            timeout=60,
-        )
-        self._crx_path = ext_dir + ".crx"
-        if not os.path.exists(self._crx_path):
-            raise RuntimeError("Failed to pack chrome extension")
-        self.extension_id = extension_id_from_pem(ext_dir + ".pem")
-        logger.info(f"Packed chrome extension {self.extension_id}")
+        files = {
+            "payload.js": polyfills + "\n" + payload_code,
+            "config.js": f"self.ATTENDEE_CONTROL_URL = {json.dumps(f'ws://{self._host}:{self._control_port}')};\n",
+        }
+        for name in os.listdir(EXTENSION_TEMPLATE_DIR):
+            with open(os.path.join(EXTENSION_TEMPLATE_DIR, name), "r") as f:
+                files[name] = f.read()
 
-    def _start_http_server(self):
-        driver = self
+        # Sideload the extension: <profile>/extensions/<id>.xpi
+        extensions_dir = os.path.join(self._profile_dir, "extensions")
+        os.makedirs(extensions_dir)
+        with zipfile.ZipFile(os.path.join(extensions_dir, f"{EXTENSION_ID}.xpi"), "w") as xpi:
+            for name, content in files.items():
+                xpi.writestr(name, content)
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path.startswith("/updates.xml"):
-                    body = (f"<?xml version='1.0' encoding='UTF-8'?><gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'><app appid='{driver.extension_id}'><updatecheck codebase='http://{driver._host}:{driver._http_port}/ext.crx' version='1.0' /></app></gupdate>").encode()
-                    content_type = "application/xml"
-                elif self.path.startswith("/ext.crx"):
-                    with open(driver._crx_path, "rb") as f:
-                        body = f.read()
-                    content_type = "application/x-chrome-extension"
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+        with open(os.path.join(self._profile_dir, "user.js"), "w") as f:
+            for key, value in FIREFOX_PREFS.items():
+                f.write(f"user_pref({json.dumps(key)}, {json.dumps(value)});\n")
 
-            def log_message(self, format, *args):
-                logger.info("extension http server: " + format % args)
-
-        self._http_server = http.server.ThreadingHTTPServer((self._host, 0), Handler)
-        self._http_port = self._http_server.server_address[1]
-        threading.Thread(target=self._http_server.serve_forever, daemon=True, name="extension-http-server").start()
+        logger.info(f"Built firefox profile with extension at {self._profile_dir}")
 
     # ---- command channel ----
 
@@ -349,7 +353,8 @@ class ExtensionDriver:
     def execute_cdp_cmd(self, cmd, params):
         # No CDP. Emulate the few commands the adapter uses.
         if cmd == "Page.captureSnapshot":
-            return {"data": self._command("mhtml")}
+            # Firefox has no MHTML capture API
+            return {"data": ""}
         if cmd == "Page.getNavigationHistory":
             return {"currentIndex": 0, "entries": [{"url": self.current_url}]}
         if cmd == "Runtime.evaluate":
@@ -361,7 +366,7 @@ class ExtensionDriver:
         pass
 
     def quit(self):
-        for server in (self._control_server, self._http_server):
+        for server in (self._control_server,):
             try:
                 server.shutdown()
             except Exception:

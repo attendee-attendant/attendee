@@ -1,6 +1,6 @@
 // Control channel between the Python bot process and the browser.
 // Replaces chromedriver / CDP: Python sends commands over a websocket, we execute them with extension APIs.
-importScripts("config.js"); // defines self.ATTENDEE_CONTROL_URL
+// config.js (listed before this file in the manifest) defines self.ATTENDEE_CONTROL_URL
 
 // Runs in the page's MAIN world. Must be self contained, because chrome.scripting serializes it.
 function pageOp(op, payload) {
@@ -180,10 +180,6 @@ async function runInPage(op, payload) {
   return result;
 }
 
-function blobToText(blob) {
-  return blob.text();
-}
-
 async function handleCommand(msg) {
   switch (msg.cmd) {
     case "exec":
@@ -205,11 +201,6 @@ async function handleCommand(msg) {
       const tab = await getTab();
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
       return { ok: true, value: dataUrl.split(",")[1] };
-    }
-    case "mhtml": {
-      const tab = await getTab();
-      const blob = await chrome.pageCapture.saveAsMHTML({ tabId: tab.id });
-      return { ok: true, value: await blobToText(blob) };
     }
     case "get_cookies": {
       const tab = await getTab();
@@ -269,7 +260,7 @@ function connect() {
   socket.onerror = () => {};
 }
 
-// Websocket traffic keeps the MV3 service worker alive
+// Keepalive (the bot also sets extensions.background.idle.enabled=false so the event page is never suspended)
 setInterval(() => {
   if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ keepalive: true }));
 }, 20000);

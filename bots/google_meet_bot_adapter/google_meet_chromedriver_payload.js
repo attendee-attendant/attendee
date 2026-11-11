@@ -1242,7 +1242,8 @@ class WebSocketClient {
   static MAX_PENDING_JSON_MESSAGES = 1000;
 
   constructor() {
-      this.wsUrl = `ws://localhost:${window.initialData.websocketPort}`;
+      // Firefox has no --host-resolver-rules, so connect to the bot's loopback IP directly
+      this.wsUrl = `ws://${window.initialData.websocketHost || 'localhost'}:${window.initialData.websocketPort}`;
       console.log('WebSocketClient url', this.wsUrl);
       this.ws = null;
       this.mediaSendingEnabled = false;

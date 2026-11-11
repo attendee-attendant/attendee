@@ -821,45 +821,25 @@ class WebBotAdapter(BotAdapter):
     def init_extension_driver(self):
         from .extension_driver import ExtensionDriver
 
-        chrome_args = [
-            "--autoplay-policy=no-user-gesture-required",
-            "--use-fake-device-for-media-stream",
-            "--use-fake-ui-for-media-stream",
-            f"--window-size={self.video_frame_size[0]},{self.video_frame_size[1]}",
-            "--start-fullscreen",
-            "--window-position=0,0",
-            "--disable-application-cache",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=LocalNetworkAccessChecks",
-            "--password-store=basic",
-            # Suppresses the "unsupported command-line flag" infobar (e.g. for --no-sandbox or
-            # --disable-blink-features=AutomationControlled), which shifts the page down and breaks
-            # humanized clicks. chromedriver always passes it too.
-            "--test-type",
+        self.write_chrome_policies_file()
+
+        # --kiosk gives a fullscreen window with no browser UI, so page coordinates == screen coordinates
+        browser_args = [
+            "--kiosk",
+            "--width",
+            str(self.video_frame_size[0]),
+            "--height",
+            str(self.video_frame_size[1]),
         ]
-        if self.subclass_specific_use_disable_gpu_chrome_option():
-            chrome_args.append("--disable-gpu")
-        if os.getenv("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
-            chrome_args += ["--no-sandbox", "--disable-setuid-sandbox"]
-        if self.websocket_host:
-            chrome_args.append(f"--host-resolver-rules=MAP localhost {self.websocket_host}")
-
-        class ArgCollector:
-            def add_argument(self, arg):
-                chrome_args.append(arg)
-
-        self.add_subclass_specific_chrome_options(ArgCollector())
 
         if self.driver:
             self.teardown_driver(graceful_shutdown_fn=self.default_graceful_driver_shutdown)
             self.driver = None
 
         self.driver = ExtensionDriver(
-            chrome_args=chrome_args,
+            browser_args=browser_args,
             payload_code=self.build_payload_code(),
             host=self.websocket_host,
-            write_policies_fn=self.write_chrome_policies_file,
         )
 
     def init_driver(self):
@@ -918,7 +898,8 @@ class WebBotAdapter(BotAdapter):
         self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": self.build_payload_code()})
 
     def build_payload_code(self):
-        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, perParticipantRealtimeVideoConfiguration: {json.dumps(self.per_participant_realtime_video_configuration.to_dict())}, roomSyncSourceParticipantConfiguration: {json.dumps(self.room_sync_source_participant_configuration.to_dict()) if self.room_sync_source_participant_configuration else 'null'}, sendPerParticipantVideo: {'true' if self.add_per_participant_video_frame_callback else 'false'}, collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}}}"
+        websocket_host = self.websocket_host or "localhost"
+        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, websocketHost: {json.dumps(websocket_host)}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, perParticipantRealtimeVideoConfiguration: {json.dumps(self.per_participant_realtime_video_configuration.to_dict())}, roomSyncSourceParticipantConfiguration: {json.dumps(self.room_sync_source_participant_configuration.to_dict()) if self.room_sync_source_participant_configuration else 'null'}, sendPerParticipantVideo: {'true' if self.add_per_participant_video_frame_callback else 'false'}, collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}}}"
 
         # Get directory of current file
         current_dir = os.path.dirname(os.path.abspath(__file__))

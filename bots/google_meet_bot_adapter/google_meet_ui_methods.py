@@ -386,8 +386,9 @@ class GoogleMeetUIMethods:
                 top: r.top,
                 width: r.width,
                 height: r.height,
-                screenX: window.screenX,
-                screenY: window.screenY,
+                // Firefox: position of the page content on screen (excludes any browser UI / infobars)
+                screenX: window.mozInnerScreenX ?? window.screenX,
+                screenY: window.mozInnerScreenY ?? window.screenY,
                 dpr: window.devicePixelRatio || 1
             };
             """,
