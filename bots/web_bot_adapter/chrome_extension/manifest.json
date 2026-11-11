@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Attendee Bot",
+  "version": "1.0",
+  "permissions": ["tabs", "scripting", "cookies", "pageCapture"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["payload.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
