@@ -1274,22 +1274,7 @@ class GoogleMeetUIMethods:
             },
         )
 
-        # Keyboard-only join through X11. No WebDriver element lookups, typing or clicks.
-        time.sleep(4)  # let the pre-join screen render
-        self.ensure_x11_input()
-        for key in ("d", "e"):  # Ctrl+D = microphone off, Ctrl+E = camera off
-            self.x11_input.key_press("Control")
-            self.x11_input.key_press(key)
-            self.x11_input.key_release(key)
-            self.x11_input.key_release("Control")
-            time.sleep(0.6)
-        time.sleep(0.5)
-        for char in self.display_name:
-            self._x11_type_char(char)
-            time.sleep(0.06)
-        time.sleep(0.5)
-        self.x11_input.key_press("Enter")  # submits "Ask to join"
-        self.x11_input.key_release("Enter")
+        self.join_via_keyboard()
 
         self.click_captions_button()
 
@@ -1308,6 +1293,104 @@ class GoogleMeetUIMethods:
             self.turn_off_reactions()
 
         self.ready_to_show_bot_image()
+
+    CONTINUE_AS_GUEST_BUTTON_XPATH = '//button[contains(., "Continue as guest")] | //div[@role="button"][contains(., "Continue as guest")]'
+    NAME_INPUT_CSS_SELECTOR = 'input[type="text"][aria-label="Your name"], input[type="text"][aria-label="Enter your name"]'
+
+    def x11_press_key_combo(self, *keys):
+        for key in keys:
+            self.x11_input.key_press(key)
+        for key in reversed(keys):
+            self.x11_input.key_release(key)
+
+    def tab_until_focused(self, element, max_tabs=25):
+        # Moves focus with real Tab keypresses. WebDriver is only used to read which element has focus.
+        for _ in range(max_tabs):
+            if self.driver.execute_script("return document.activeElement === arguments[0]", element):
+                return True
+            self.x11_press_key_combo("Tab")
+            time.sleep(0.15)
+        return self.driver.execute_script("return document.activeElement === arguments[0]", element)
+
+    def wait_for_name_input(self, wait_time_seconds):
+        try:
+            return WebDriverWait(self.driver, wait_time_seconds).until(EC.presence_of_element_located((By.CSS_SELECTOR, self.NAME_INPUT_CSS_SELECTOR)))
+        except TimeoutException:
+            return None
+
+    def continue_as_guest_via_keyboard_if_needed(self):
+        # Some pre-join screens have no name input, only "Continue as guest" and "Sign in with Google".
+        continue_as_guest_button = self.find_element_by_selector(By.XPATH, self.CONTINUE_AS_GUEST_BUTTON_XPATH)
+        if not continue_as_guest_button:
+            return
+        logger.info("Found continue_as_guest_button. Tabbing to it and pressing Enter...")
+        if not self.tab_until_focused(continue_as_guest_button):
+            raise UiCouldNotLocateElementException("Could not move keyboard focus to the continue as guest button", "continue_as_guest_via_keyboard")
+        self.x11_press_key_combo("Enter")
+        if not self.wait_for_name_input(wait_time_seconds=15):
+            raise UiCouldNotLocateElementException("Name input did not appear after continuing as guest", "continue_as_guest_via_keyboard")
+
+    def type_display_name_via_keyboard(self, name_input):
+        if not self.tab_until_focused(name_input):
+            raise UiCouldNotLocateElementException("Could not move keyboard focus to the name input", "type_display_name_via_keyboard")
+        if self.display_name.isascii():
+            for char in self.display_name:
+                self._x11_type_char(char)
+                time.sleep(0.06)
+        else:
+            # X11 keysyms in _x11_type_char only cover ASCII, so paste other names through the clipboard with Ctrl+V.
+            self.human_copy_and_paste(self.display_name)
+
+    def join_via_keyboard(self):
+        # Join with X11 keystrokes only. WebDriver reads the page but never clicks or types.
+        self.ensure_x11_input()
+
+        for attempt_index in range(3):
+            time.sleep(4)  # let the pre-join screen render
+            if self.google_meet_bot_login_session or not self.find_blocked_element():
+                break
+            logger.warning(f"Google is blocking us on the pre-join screen and the bot is not signed in. Reloading the meeting URL (attempt {attempt_index + 1} of 3).")
+            self.driver.get(self.meeting_url)
+
+        self.check_if_meeting_is_found()
+        self.look_for_blocked_element("join_via_keyboard")
+        self.look_for_login_required_element("join_via_keyboard")
+        self.continue_as_guest_via_keyboard_if_needed()
+
+        for key in ("d", "e"):  # Ctrl+D = microphone off, Ctrl+E = camera off
+            self.x11_press_key_combo("Control", key)
+            time.sleep(0.6)
+        time.sleep(0.5)
+
+        name_input = self.wait_for_name_input(wait_time_seconds=2 if self.google_meet_bot_login_session else 10)
+        if name_input:
+            # The "Sign in with your Google account" popup opens with focus on its "Got it" button, which swallows
+            # the first typed characters. Escape closes it and returns focus to the name input.
+            self.x11_press_key_combo("Escape")
+            time.sleep(0.5)
+            self.type_display_name_via_keyboard(name_input)
+            time.sleep(0.5)
+            typed_name = name_input.get_attribute("value")
+            if typed_name != self.display_name:
+                logger.warning(f"Name input contains {typed_name!r} instead of {self.display_name!r}. Clearing it and typing again...")
+                self.tab_until_focused(name_input)
+                self.x11_press_key_combo("Control", "a")
+                self.x11_press_key_combo("Backspace")
+                self.type_display_name_via_keyboard(name_input)
+                time.sleep(0.5)
+            target_for_enter = name_input  # Enter in the name input submits "Ask to join"
+        else:
+            # Signed-in bots have no name input, so focus the join button instead
+            target_for_enter = self.locate_element(
+                step="join_button",
+                condition=EC.presence_of_element_located((By.XPATH, self.join_now_button_selector())),
+                wait_time_seconds=60,
+            )
+
+        if not self.tab_until_focused(target_for_enter):
+            raise UiCouldNotLocateElementException("Could not move keyboard focus to submit the join request", "join_via_keyboard")
+        logger.info("Pressing Enter to join...")
+        self.x11_press_key_combo("Enter")
 
     def verify_expected_audio_configuration(self):
         # Just in case we don't want to run this check anymore, we'll have an env var to bypass it.
