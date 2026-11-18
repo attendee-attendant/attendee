@@ -1320,15 +1320,51 @@ class GoogleMeetUIMethods:
 
     def continue_as_guest_via_keyboard_if_needed(self):
         # Some pre-join screens have no name input, only "Continue as guest" and "Sign in with Google".
+        # Returns True if we went through that screen.
         continue_as_guest_button = self.find_element_by_selector(By.XPATH, self.CONTINUE_AS_GUEST_BUTTON_XPATH)
         if not continue_as_guest_button:
-            return
+            return False
         logger.info("Found continue_as_guest_button. Tabbing to it and pressing Enter...")
         if not self.tab_until_focused(continue_as_guest_button):
             raise UiCouldNotLocateElementException("Could not move keyboard focus to the continue as guest button", "continue_as_guest_via_keyboard")
         self.x11_press_key_combo("Enter")
         if not self.wait_for_name_input(wait_time_seconds=15):
             raise UiCouldNotLocateElementException("Name input did not appear after continuing as guest", "continue_as_guest_via_keyboard")
+        return True
+
+    MEDIA_TOGGLES = (("d", "microphone"), ("e", "camera"))  # Ctrl+D = microphone, Ctrl+E = camera
+
+    def wait_for_element_to_disappear(self, selector_type, selector, wait_time_seconds):
+        deadline = time.time() + wait_time_seconds
+        while self.find_element_by_selector(selector_type, selector):
+            if time.time() > deadline:
+                return False
+            time.sleep(0.2)
+        return True
+
+    def turn_off_media_inputs_via_keyboard(self, use_shortcuts):
+        for shortcut_key, device in self.MEDIA_TOGGLES:
+            # The "Turn off <device>" button is only present while the device is on
+            turn_off_selector = f'div[aria-label="Turn off {device}"], button[aria-label="Turn off {device}"]'
+            if use_shortcuts:
+                self.x11_press_key_combo("Control", shortcut_key)
+                if self.wait_for_element_to_disappear(By.CSS_SELECTOR, turn_off_selector, wait_time_seconds=2):
+                    continue
+                # When Meet doesn't handle the shortcut, Chrome does (Ctrl+D opens the bookmark bubble), and that
+                # takes keyboard focus away from the page. Escape closes it.
+                logger.info(f"Ctrl+{shortcut_key.upper()} did not turn off the {device}. Pressing Escape and falling back to its button...")
+                self.x11_press_key_combo("Escape")
+                time.sleep(0.5)
+
+            turn_off_button = self.find_element_by_selector(By.CSS_SELECTOR, turn_off_selector)
+            if not turn_off_button:
+                continue
+            if not self.tab_until_focused(turn_off_button):
+                logger.warning(f"Could not move keyboard focus to the button that turns off the {device}")
+                continue
+            self.x11_press_key_combo("space")
+            if not self.wait_for_element_to_disappear(By.CSS_SELECTOR, turn_off_selector, wait_time_seconds=2):
+                logger.warning(f"Could not turn off the {device} via keyboard")
 
     def type_display_name_via_keyboard(self, name_input):
         if not self.tab_until_focused(name_input):
@@ -1355,19 +1391,21 @@ class GoogleMeetUIMethods:
         self.check_if_meeting_is_found()
         self.look_for_blocked_element("join_via_keyboard")
         self.look_for_login_required_element("join_via_keyboard")
-        self.continue_as_guest_via_keyboard_if_needed()
+        went_through_guest_screen = self.continue_as_guest_via_keyboard_if_needed()
 
-        for key in ("d", "e"):  # Ctrl+D = microphone off, Ctrl+E = camera off
-            self.x11_press_key_combo("Control", key)
-            time.sleep(0.6)
+        # Meet's Ctrl+D / Ctrl+E shortcuts are not active in the dialog that follows "Continue as guest".
+        # Pressing them there opens Chrome's bookmark bubble instead, so use the buttons.
+        self.turn_off_media_inputs_via_keyboard(use_shortcuts=not went_through_guest_screen)
         time.sleep(0.5)
 
         name_input = self.wait_for_name_input(wait_time_seconds=2 if self.google_meet_bot_login_session else 10)
         if name_input:
-            # The "Sign in with your Google account" popup opens with focus on its "Got it" button, which swallows
-            # the first typed characters. Escape closes it and returns focus to the name input.
-            self.x11_press_key_combo("Escape")
-            time.sleep(0.5)
+            if not went_through_guest_screen:
+                # The "Sign in with your Google account" popup opens with focus on its "Got it" button, which swallows
+                # the first typed characters. Escape closes it and returns focus to the name input. Not done on the
+                # guest screen's name dialog, which Escape could close.
+                self.x11_press_key_combo("Escape")
+                time.sleep(0.5)
             self.type_display_name_via_keyboard(name_input)
             time.sleep(0.5)
             typed_name = name_input.get_attribute("value")
