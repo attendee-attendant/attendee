@@ -118,6 +118,11 @@ class TestGoogleMeetBot(TransactionTestCase):
         patcher6.start()
         self.addCleanup(patcher6.stop)
 
+        # Mock join_via_keyboard, which sends X11 keystrokes and needs a real display
+        patcher7 = patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.join_via_keyboard", return_value=None)
+        patcher7.start()
+        self.addCleanup(patcher7.stop)
+
         # Recreate organization and project for each test
         self.organization = Organization.objects.create(name="Test Org")
         self.project = Project.objects.create(name="Test Project", organization=self.organization)

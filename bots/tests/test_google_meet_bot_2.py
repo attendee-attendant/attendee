@@ -128,6 +128,11 @@ class TestGoogleMeetBot2(TransactionTestCase):
         patcher6.start()
         self.addCleanup(patcher6.stop)
 
+        # Mock join_via_keyboard, which sends X11 keystrokes and needs a real display
+        patcher7 = patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.join_via_keyboard", return_value=None)
+        patcher7.start()
+        self.addCleanup(patcher7.stop)
+
         # Recreate organization and project for each test
         self.organization = Organization.objects.create(name="Test Org")
         self.project = Project.objects.create(name="Test Project", organization=self.organization)
@@ -1689,7 +1694,7 @@ class TestGoogleMeetBot2(TransactionTestCase):
         then retries with login when meeting requires sign in.
 
         This test exercises the actual retry logic in repeatedly_attempt_to_join_meeting(),
-        attempt_to_join_meeting(), and fill_out_name_input() by mocking at a low level
+        attempt_to_join_meeting(), and join_via_keyboard() by mocking at a low level
         (look_for_login_required_element raises exception on first attempt only).
 
         Flow:
@@ -1773,6 +1778,7 @@ class TestGoogleMeetBot2(TransactionTestCase):
         # Mock lower-level methods to allow actual attempt_to_join_meeting and fill_out_name_input logic to run
         with (
             patch.object(GoogleMeetUIMethods, "look_for_login_required_element", side_effect=mock_look_for_login_required_element),
+            patch.object(GoogleMeetUIMethods, "join_via_keyboard", new=lambda adapter_instance: adapter_instance.look_for_login_required_element("join_via_keyboard")),
             patch("selenium.webdriver.support.ui.WebDriverWait", return_value=mock_wait),
             patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.retrieve_name_input_element", side_effect=mock_retrieve_name_input_element),
             patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.look_for_blocked_element", return_value=None),
