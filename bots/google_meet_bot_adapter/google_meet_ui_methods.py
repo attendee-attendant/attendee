@@ -1274,25 +1274,22 @@ class GoogleMeetUIMethods:
             },
         )
 
-        self.check_if_meeting_is_found()
-
-        self.fill_out_name_input()
-
-        self.turn_off_media_inputs()
-
-        self.verify_expected_audio_configuration()
-
-        logger.info("Waiting for the 'Ask to join' or 'Join now' button...")
-        join_button = self.locate_element(
-            step="join_button",
-            condition=EC.presence_of_element_located((By.XPATH, self.join_now_button_selector())),
-            wait_time_seconds=60,
-        )
-        logger.info("Clicking the join button...")
-        if self.ui_interaction_mode == "humanized":
-            self.humanized_navigate_to_and_click_element(join_button, fallback_to_forceful_click_for_zero_size_element=True)
-        else:
-            self.click_element_with_fallback_to_forceful_click(join_button, "join_button")
+        # Keyboard-only join through X11. No WebDriver element lookups, typing or clicks.
+        time.sleep(4)  # let the pre-join screen render
+        self.ensure_x11_input()
+        for key in ("d", "e"):  # Ctrl+D = microphone off, Ctrl+E = camera off
+            self.x11_input.key_press("Control")
+            self.x11_input.key_press(key)
+            self.x11_input.key_release(key)
+            self.x11_input.key_release("Control")
+            time.sleep(0.6)
+        time.sleep(0.5)
+        for char in self.display_name:
+            self._x11_type_char(char)
+            time.sleep(0.06)
+        time.sleep(0.5)
+        self.x11_input.key_press("Enter")  # submits "Ask to join"
+        self.x11_input.key_release("Enter")
 
         self.click_captions_button()
 
